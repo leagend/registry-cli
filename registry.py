@@ -56,8 +56,12 @@ DEBUG = False
 # this class is created for testing
 class Requests:
 
+    def __init__(self):
+        self.last_response = None
+
     def request(self, method, url, **kwargs):
-        return requests.request(method, url, **kwargs)
+        self.last_response = requests.request(method, url, **kwargs)
+        return self.last_response
 
     def bearer_request(self, method, url, auth, **kwargs):
         global DEBUG
@@ -72,14 +76,14 @@ class Requests:
                 pprint.pprint(ast.literal_eval(decode_base64(token_parsed[0])))
                 pprint.pprint(ast.literal_eval(decode_base64(token_parsed[1])))
 
-        res = requests.request(method, url, **kwargs)
-        if str(res.status_code)[0] == '2':
+        self.last_response = requests.request(method, url, **kwargs)
+        if str(self.last_response.status_code)[0] == '2':
             if DEBUG: print("[debug][registry] accepted")
-            return (res, kwargs['headers']['Authorization'])
+            return (self.last_response, kwargs['headers']['Authorization'])
 
-        if res.status_code == 401:
+        if self.last_response.status_code == 401:
             if DEBUG: print("[debug][registry] Access denied. Refreshing token...")
-            oauth = www_authenticate.parse(res.headers['Www-Authenticate'])
+            oauth = www_authenticate.parse(self.last_response.headers['Www-Authenticate'])
 
             if DEBUG:
                 print('[debug][auth][answer] Auth header:')
@@ -117,10 +121,10 @@ class Requests:
 
             kwargs['headers']['Authorization'] = 'Bearer {0}'.format(token)
         else:
-            return (res, kwargs['headers']['Authorization'])
+            return (self.last_response, kwargs['headers']['Authorization'])
 
-        res = requests.request(method, url, **kwargs)
-        return (res, kwargs['headers']['Authorization'])
+        self.last_response = requests.request(method, url, **kwargs)
+        return (self.last_response, kwargs['headers']['Authorization'])
 
 
 def natural_keys(text):
@@ -133,7 +137,7 @@ def natural_keys(text):
     def __atoi(text):
         return int(text) if text.isdigit() else text
 
-    return [__atoi(c) for c in re.split('(\d+)', text)]
+    return [__atoi(c) for c in re.split(r'(\d+)', text)]
 
 
 def decode_base64(data):
@@ -186,8 +190,9 @@ def get_auth_schemes(r,path):
 class Registry:
 
     # this is required for proper digest processing
-    HEADERS = {"Accept":
-               "application/vnd.docker.distribution.manifest.v2+json"}
+    HEADERS = {
+        "Accept": "application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v1+json"
+    }
 
     def __init__(self):
         self.username = None
@@ -236,7 +241,12 @@ class Registry:
 
 
     def send(self, path, method="GET"):
+        if DEBUG: print("[debug][funcname]: send()")
+        if DEBUG: print("[debug][request]: {0} {1}".format(method, self.hostname + path))
+        if DEBUG: print("[debug][headers]: ", self.HEADERS)
+
         if 'bearer' in self.auth_schemes:
+            if DEBUG: print("[debug][auth]: Using bearer authentication")
             (result, self.HEADERS['Authorization']) = self.http.bearer_request(
                 method, "{0}{1}".format(self.hostname, path),
                 auth=(('', '') if self.username in ["", None]
@@ -244,6 +254,7 @@ class Registry:
                 headers=self.HEADERS,
                 verify=not self.no_validate_ssl)
         else:
+            if DEBUG: print("[debug][auth]: Using basic authentication")
             result = self.http.request(
                 method, "{0}{1}".format(self.hostname, path),
                 headers=self.HEADERS,
@@ -251,11 +262,11 @@ class Registry:
                     else (self.username, self.password)),
                 verify=not self.no_validate_ssl)
 
-        # except Exception as error:
-        #     print("cannot connect to {0}\nerror {1}".format(
-        #         self.hostname,
-        #         error))
-        #     sys.exit(1)
+        if DEBUG: 
+            print("[debug][response status]: ", result.status_code)
+            print("[debug][response headers]: ", result.headers)
+            print("[debug][response content]: ", result.text[:200])  # 只打印前200个字符
+
         if str(result.status_code)[0] == '2':
             self.last_error = None
             return result
@@ -294,46 +305,123 @@ class Registry:
     #                 print("Adding {0} to tags list".format(tag))
 
     def get_tag_digest(self, image_name, tag):
+        if DEBUG: print("[debug][funcname]: get_tag_digest()")
+        
+        # 首先尝试获取 manifest list
+        self.HEADERS['Accept'] = 'application/vnd.docker.distribution.manifest.list.v2+json'
         image_headers = self.send("/v2/{0}/manifests/{1}".format(
             image_name, tag), method=self.digest_method)
+            
+        if image_headers is None:
+            # 如果失败，尝试获取 v2 manifest
+            self.HEADERS['Accept'] = 'application/vnd.docker.distribution.manifest.v2+json'
+            image_headers = self.send("/v2/{0}/manifests/{1}".format(
+                image_name, tag), method=self.digest_method)
+                
+        if image_headers is None:
+            # 如果还是失败，尝试获取 v1 manifest
+            self.HEADERS['Accept'] = 'application/vnd.docker.distribution.manifest.v1+json'
+            image_headers = self.send("/v2/{0}/manifests/{1}".format(
+                image_name, tag), method=self.digest_method)
 
         if image_headers is None:
-            print("  tag digest not found: {0}.".format(self.last_error))
+            # 尝试从错误消息中提取 digest
+            try:
+                error_content = json.loads(self.http.last_response.text)
+                if 'errors' in error_content and len(error_content['errors']) > 0:
+                    error = error_content['errors'][0]
+                    if error.get('code') == 'MANIFEST_UNKNOWN' and 'detail' in error:
+                        detail = error['detail']
+                        if 'Revision' in detail:
+                            if DEBUG: print("[debug] Found digest in error message:", detail['Revision'])
+                            return detail['Revision']
+            except Exception as e:
+                if DEBUG: print("[debug][error]: Failed to parse error message:", str(e))
+            
+            print("  tag digest not found: {0}".format(self.last_error))
             print(get_error_explanation("get_tag_digest", self.last_error))
             return None
 
-        tag_digest = image_headers.headers['Docker-Content-Digest']
+        if DEBUG:
+            print("[debug][headers]: ", image_headers.headers)
+            print("[debug][content]: ", image_headers.text[:200])
 
-        return tag_digest
+        # 尝试从响应头获取digest
+        if 'Docker-Content-Digest' in image_headers.headers:
+            return image_headers.headers['Docker-Content-Digest']
+            
+        # 如果响应头没有digest，尝试从内容中获取
+        try:
+            manifest = json.loads(image_headers.text)
+            if manifest.get('schemaVersion') == 1:
+                if DEBUG: print("[debug] Found v1 manifest")
+                return manifest.get('signatures', [{}])[0].get('signature')
+            else:
+                if DEBUG: print("[debug] Found v2 manifest")
+                return manifest.get('config', {}).get('digest')
+        except Exception as e:
+            if DEBUG: print("[debug][error]: Failed to parse manifest: ", str(e))
+            return None
+
+        return None
 
     def delete_tag(self, image_name, tag, dry_run, tag_digests_to_ignore):
         if dry_run:
             print('would delete tag {0}'.format(tag))
             return False
 
-        tag_digest = self.get_tag_digest(image_name, tag)
+        # 获取 manifest 并尝试删除
+        manifest_result = self.send("/v2/{0}/manifests/{1}".format(image_name, tag))
+        
+        if manifest_result is not None:
+            try:
+                tag_digest = manifest_result.headers.get('Docker-Content-Digest')
+                if tag_digest:
+                    return self._delete_manifest(image_name, tag, tag_digest, tag_digests_to_ignore)
+            except Exception as e:
+                if DEBUG: print("[debug][error]: Failed to get digest from manifest:", str(e))
+        
+        # 如果获取 manifest 失败,尝试从错误消息中获取 digest
+        try:
+            error_content = json.loads(self.http.last_response.text)
+            if 'errors' in error_content and len(error_content['errors']) > 0:
+                error = error_content['errors'][0]
+                if error.get('code') == 'MANIFEST_UNKNOWN' and 'detail' in error:
+                    tag_digest = error['detail'].get('Revision')
+                    if tag_digest:
+                        return self._delete_manifest(image_name, tag, tag_digest, tag_digests_to_ignore)
+        except Exception as e:
+            if DEBUG: print("[debug][error]: Failed to parse error message:", str(e))
 
+        # 最后尝试使用 get_tag_digest
+        tag_digest = self.get_tag_digest(image_name, tag)
+        if tag_digest:
+            return self._delete_manifest(image_name, tag, tag_digest, tag_digests_to_ignore)
+
+        print("failed to get digest for tag {0}".format(tag))
+        return False
+
+    def _delete_manifest(self, image_name, tag, tag_digest, tag_digests_to_ignore):
+        """Helper method to delete manifest by digest"""
         if tag_digest in tag_digests_to_ignore:
             print("Digest {0} for tag {1} is referenced by another tag or has already been deleted and will be ignored".format(
                 tag_digest, tag))
             return True
-
-        if tag_digest is None:
-            return False
-
+        
         delete_result = self.send("/v2/{0}/manifests/{1}".format(
             image_name, tag_digest), method="DELETE")
-
+        
         if delete_result is None:
+            if self.last_error == 404:
+                print("Tag {0} already deleted".format(tag))
+                return True
             print("failed, error: {0}".format(self.last_error))
             print(get_error_explanation("delete_tag", self.last_error))
             return False
-
+        
         tag_digests_to_ignore.append(tag_digest)
-
         print("done")
         return True
-
 
     def list_tag_layers(self, image_name, tag):
         layers_result = self.send("/v2/{0}/manifests/{1}".format(
@@ -621,17 +709,22 @@ def get_tags_like(args_tags_like, tags_list, plain):
 
 
 def get_tags(all_tags_list, image_name, tags_like, plain):
-    # check if there are args for special tags
     result = set()
+    
+    # get tags from image name if any
+    if ":" in image_name:
+        (_, tag_name) = image_name.split(":")
+        if tag_name in all_tags_list:  # 验证tag是否存在
+            return set([tag_name])
+        else:
+            print("Tag {0} not found in image".format(tag_name))
+            return set()
+        
+    # check if there are args for special tags
     if tags_like:
         result = get_tags_like(tags_like, all_tags_list, plain)
     else:
         result.update(all_tags_list)
-
-    # get tags from image name if any
-    if ":" in image_name:
-        (image_name, tag_name) = image_name.split(":")
-        result = set([tag_name])
 
     return result
 
@@ -793,27 +886,35 @@ def main_loop(args):
     for image_name in image_list:
         if not args.plain:
             print("---------------------------------")
+        
+        # 处理image:tag格式
+        base_image_name = image_name.split(':')[0] if ':' in image_name else image_name
+        if not args.plain:
             print("Image: {0}".format(image_name))
-        all_tags_list = registry.list_tags(image_name)
+            
+        all_tags_list = registry.list_tags(base_image_name)
 
         if not all_tags_list:
             print("  no tags!")
             continue
 
         if args.order_by_date:
-            tags_list = get_ordered_tags(registry, image_name, all_tags_list, args.order_by_date)
+            tags_list = get_ordered_tags(registry, base_image_name, all_tags_list, args.order_by_date)
         else:
             tags_list = get_tags(all_tags_list, image_name, args.tags_like, args.plain)
 
-        # print(tags and optionally layers
+        if not tags_list:  # 如果没有找到指定的tag，跳过后续操作
+            continue
+
+        # print tags and optionally layers
         for tag in tags_list:
             if not args.plain:
                 print("  tag: {0}".format(tag))
             else:
-                print("{0}:{1}".format(image_name, tag))
+                print("{0}:{1}".format(base_image_name, tag))
 
             if args.layers:
-                for layer in registry.list_tag_layers(image_name, tag):
+                for layer in registry.list_tag_layers(base_image_name, tag):
                     if 'size' in layer:
                         print("    layer: {0}, size: {1}".format(
                             layer['digest'], layer['size']))
@@ -829,7 +930,7 @@ def main_loop(args):
         if args.keep_tags_like:
             keep_tags.extend(get_tags_like(args.keep_tags_like, tags_list))
         if args.keep_by_hours:
-            keep_tags.extend(get_newer_tags(registry, image_name,
+            keep_tags.extend(get_newer_tags(registry, base_image_name,
                                             args.keep_by_hours, tags_list))
         keep_tags = list(set(keep_tags))  # Eliminate duplicates
 
@@ -838,7 +939,7 @@ def main_loop(args):
             if args.delete_all:
                 tags_list_to_delete = list(tags_list)
             else:
-                ordered_tags_list = get_ordered_tags(registry, image_name, tags_list, args.order_by_date)
+                ordered_tags_list = get_ordered_tags(registry, base_image_name, tags_list, args.order_by_date)
                 tags_list_to_delete = ordered_tags_list[:-keep_last_versions]
 
                 # A manifest might be shared between different tags. Explicitly add those
@@ -850,12 +951,12 @@ def main_loop(args):
 
             keep_tags.sort() # Make order deterministic for testing
             delete_tags(
-                registry, image_name, args.dry_run,
+                registry, base_image_name, args.dry_run,
                 tags_list_to_delete, keep_tags)
 
         # delete tags by age in hours
         if args.delete_by_hours:
-            delete_tags_by_age(registry, image_name, args.dry_run,
+            delete_tags_by_age(registry, base_image_name, args.dry_run,
                                args.delete_by_hours, keep_tags)
 
 if __name__ == "__main__":
